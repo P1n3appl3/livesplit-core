@@ -61,7 +61,7 @@ unsafe fn ungrab_all(xlib: &Xlib, display: *mut Display) {
         for _i in 0..rootwindow {
             // FIXME: This loop looks very stupid, but it somehow it prevents
             // button presses getting lost.
-            (xlib.XUngrabKey)(display, AnyKey, AnyModifier, rootwindow);
+            (xlib.XUngrabKey)(display, AnyKey, 0, rootwindow);
         }
     }
 }
@@ -75,7 +75,7 @@ unsafe fn grab_all(xlib: &Xlib, display: *mut Display, keylist: &[c_uint]) {
             (xlib.XGrabKey)(
                 display,
                 code as c_int,
-                AnyModifier,
+                0,
                 rootwindow,
                 false as _,
                 GrabModeAsync,

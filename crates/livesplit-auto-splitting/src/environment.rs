@@ -158,7 +158,12 @@ impl Environment {
         Ok(())
     }
 
-    pub fn read_into_buf(&mut self, address: i64, buf: i32, buf_len: i32) -> Result<i32, Trap> {
+    pub fn read_into_buf(
+        &mut self,
+        address: i64,
+        buf: i32,
+        buf_len: i32,
+    ) -> Result<i32, Trap> {
         if let Some(process) = &self.process {
             if process
                 .read_buf(address as u64, get_bytes(&mut self.memory, buf, buf_len)?)

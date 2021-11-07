@@ -50,7 +50,7 @@ impl Runtime {
     pub fn new(binary: &[u8]) -> anyhow::Result<Self> {
         let engine = Engine::new(Config::new().interruptable(true))?;
         let store = Store::new(&engine);
-        let module = Module::from_binary( &engine, binary)?;
+        let module = Module::from_binary(&engine, binary)?;
         let env = Rc::new(RefCell::new(Environment::default()));
         let mut linker = Linker::new(&store);
 
@@ -61,12 +61,16 @@ impl Runtime {
 
         linker.func("env", "push_pointer_path", {
             let env = env.clone();
-            move |ptr, len, pointer_type| env.borrow_mut().push_pointer_path(ptr, len, pointer_type)
+            move |ptr, len, pointer_type| {
+                env.borrow_mut().push_pointer_path(ptr, len, pointer_type)
+            }
         })?;
 
         linker.func("env", "push_offset", {
             let env = env.clone();
-            move |pointer_path_id, offset| env.borrow_mut().push_offset(pointer_path_id, offset)
+            move |pointer_path_id, offset| {
+                env.borrow_mut().push_offset(pointer_path_id, offset)
+            }
         })?;
 
         linker.func("env", "get_u8", {
@@ -196,7 +200,9 @@ impl Runtime {
 
         linker.func("env", "read_into_buf", {
             let env = env.clone();
-            move |address, buf, buf_len| env.borrow_mut().read_into_buf(address, buf, buf_len)
+            move |address, buf, buf_len| {
+                env.borrow_mut().read_into_buf(address, buf, buf_len)
+            }
         })?;
 
         linker.func("env", "set_variable", {
@@ -220,29 +226,21 @@ impl Runtime {
         let instance = linker.instantiate(&module)?;
         env.borrow_mut().memory = instance.exports().find_map(Export::into_memory);
 
-        let hooked = instance
-            .get_typed_func("hooked").ok();
+        let hooked = instance.get_typed_func("hooked").ok();
 
-        let unhooked = instance
-            .get_typed_func("unhooked").ok();
+        let unhooked = instance.get_typed_func("unhooked").ok();
 
-        let should_start = instance
-            .get_typed_func("should_start").ok();
+        let should_start = instance.get_typed_func("should_start").ok();
 
-        let should_split = instance
-            .get_typed_func("should_split").ok();
+        let should_split = instance.get_typed_func("should_split").ok();
 
-        let should_reset = instance
-            .get_typed_func("should_reset").ok();
+        let should_reset = instance.get_typed_func("should_reset").ok();
 
-        let is_loading = instance
-            .get_typed_func("is_loading").ok();
+        let is_loading = instance.get_typed_func("is_loading").ok();
 
-        let game_time = instance
-            .get_typed_func("game_time").ok();
+        let game_time = instance.get_typed_func("game_time").ok();
 
-        let update = instance
-            .get_typed_func("update").ok();
+        let update = instance.get_typed_func("update").ok();
 
         Ok(Self {
             instance,
@@ -349,7 +347,8 @@ impl Runtime {
                     self.is_loading_val = Some(is_loading.call(())? != 0);
                 }
                 if let Some(game_time) = &self.game_time {
-                    self.game_time_val = Some(game_time.call(())?).filter(|v| !v.is_nan());
+                    self.game_time_val =
+                        Some(game_time.call(())?).filter(|v| !v.is_nan());
                 }
 
                 if let Some(should_split) = &self.should_split {
