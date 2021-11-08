@@ -1,10 +1,23 @@
 use crate::KeyCode;
-use evdev::{self, Device, EventType, InputEventKind, Key};
+use input::{
+    event::{
+        keyboard::{KeyState, KeyboardEventTrait},
+        KeyboardEvent::Key,
+    },
+    Event, Libinput, LibinputInterface,
+};
+use libc::{O_RDONLY, O_RDWR, O_WRONLY};
+use std::fs::{File, OpenOptions};
+use std::os::unix::{
+    fs::OpenOptionsExt,
+    io::{FromRawFd, IntoRawFd},
+};
+use std::path::Path;
+
 use mio::{unix::SourceFd, Events, Interest, Poll, Token, Waker};
 use promising_future::{future_promise, Promise};
 use std::{
     collections::hash_map::HashMap,
-    convert::{TryFrom, TryInto},
     os::unix::prelude::{AsRawFd, RawFd},
     sync::mpsc::{channel, Sender},
     thread::{self, JoinHandle},
@@ -17,7 +30,7 @@ pub enum Error {
     AlreadyRegistered,
     NotRegistered,
     UnknownKey,
-    EvDev,
+    LibInput,
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -32,8 +45,8 @@ enum Message {
     End,
 }
 
-// Low numbered tokens are allocated to devices
-const PING_TOKEN: Token = Token(256);
+const INPUT_TOKEN: Token = Token(0);
+const PING_TOKEN: Token = Token(1);
 
 pub struct Hook {
     sender: Sender<Message>,
@@ -51,27 +64,48 @@ impl Drop for Hook {
     }
 }
 
+struct Interface;
+impl LibinputInterface for Interface {
+    fn open_restricted(
+        &mut self,
+        path: &Path,
+        flags: i32,
+    ) -> std::result::Result<RawFd, i32> {
+        OpenOptions::new()
+            .custom_flags(flags)
+            .read((flags & O_RDONLY != 0) | (flags & O_RDWR != 0))
+            .write((flags & O_WRONLY != 0) | (flags & O_RDWR != 0))
+            .open(path)
+            .map(|file| file.into_raw_fd())
+            .map_err(|err| err.raw_os_error().unwrap())
+    }
+    fn close_restricted(&mut self, fd: RawFd) {
+        unsafe {
+            File::from_raw_fd(fd);
+        }
+    }
+}
+
 impl Hook {
     pub fn new() -> Result<Self> {
         let (sender, receiver) = channel();
         let mut poll = Poll::new().map_err(|_| Error::EPoll)?;
         let waker = Waker::new(poll.registry(), PING_TOKEN).map_err(|_| Error::EPoll)?;
 
-        let mut devices: Vec<Device> = evdev::enumerate()
-            .filter(|d| d.supported_events().contains(EventType::KEY))
-            .collect();
-        let fds: Vec<RawFd> = devices.iter().map(|d| d.as_raw_fd()).collect();
-
-        for (i, fd) in fds.iter().enumerate() {
-            poll.registry()
-                .register(&mut SourceFd(fd), Token(i), Interest::READABLE)
-                .map_err(|_| Error::EPoll)?;
-        }
-
         let join_handle = thread::spawn(move || -> Result<()> {
             let mut result = Ok(());
             let mut events = Events::with_capacity(1024);
-            let mut hotkeys: HashMap<Key, Box<dyn FnMut() + Send>> = HashMap::new();
+            let mut hotkeys: HashMap<u32, Box<dyn FnMut() + Send>> = HashMap::new();
+            let mut input = Libinput::new_with_udev(Interface);
+
+            input.udev_assign_seat("seat0").unwrap();
+            poll.registry()
+                .register(
+                    &mut SourceFd(&input.as_raw_fd()),
+                    INPUT_TOKEN,
+                    Interest::READABLE,
+                )
+                .map_err(|_| Error::EPoll)?;
 
             'event_loop: loop {
                 if poll.poll(&mut events, None).is_err() {
@@ -80,32 +114,20 @@ impl Hook {
                 }
 
                 for mio_event in &events {
-                    if mio_event.token().0 < devices.len() {
-                        let idx = mio_event.token().0;
-                        for ev in devices[idx].fetch_events().map_err(|_| Error::EvDev)? {
-                            if let InputEventKind::Key(k) = ev.kind() {
-                                // println!("{:?} - {}", k, ev.value());
-                                if ev.value() != 0 {
-                                    if let Some(callback) = hotkeys.get_mut(&k) {
-                                        callback();
-                                    }
-                                }
-                            }
-                        }
-                    } else if mio_event.token() == PING_TOKEN {
+                    if mio_event.token() == PING_TOKEN {
                         for message in receiver.try_iter() {
                             match message {
-                                Message::Register(key, callback, promise) => promise.set(
-                                    key.try_into()
-                                        .and_then(|k| {
-                                            hotkeys
-                                                .insert(k, callback)
-                                                .ok_or(Error::AlreadyRegistered)
-                                        })
-                                        .and(Ok(())),
-                                ),
+                                Message::Register(key, callback, promise) => {
+                                    promise.set(code_for(key).and_then(|k| {
+                                        if hotkeys.insert(k, callback).is_some() {
+                                            Err(Error::AlreadyRegistered)
+                                        } else {
+                                            Ok(())
+                                        }
+                                    }))
+                                }
                                 Message::Unregister(key, promise) => promise.set(
-                                    key.try_into()
+                                    code_for(key)
                                         .and_then(|k| {
                                             hotkeys.remove(&k).ok_or(Error::NotRegistered)
                                         })
@@ -113,6 +135,18 @@ impl Hook {
                                 ),
                                 Message::End => {
                                     break 'event_loop;
+                                }
+                            }
+                        }
+                    } else if mio_event.token() == INPUT_TOKEN {
+                        input.dispatch().unwrap();
+                        for event in &mut input {
+                            if let Event::Keyboard(Key(k)) = event {
+                                if k.key_state() == KeyState::Pressed {
+                                    println!("Key: {}", k.key());
+                                    if let Some(callback) = hotkeys.get_mut(&k.key()) {
+                                        callback();
+                                    }
                                 }
                             }
                         }
@@ -161,6 +195,227 @@ pub(crate) fn try_resolve(_key_code: KeyCode) -> Option<String> {
     None
 }
 
+fn code_for(key: KeyCode) -> Result<u32> {
+    use KeyCode::*;
+    Ok(match key {
+        Escape => 0x0001,
+        Digit1 => 0x0002,
+        Digit2 => 0x0003,
+        Digit3 => 0x0004,
+        Digit4 => 0x0005,
+        Digit5 => 0x0006,
+        Digit6 => 0x0007,
+        Digit7 => 0x0008,
+        Digit8 => 0x0009,
+        Digit9 => 0x000a,
+        Digit0 => 0x000b,
+        Minus => 0x000c,
+        Equal => 0x000d,
+        Backspace => 0x000e,
+        Tab => 0x000f,
+        KeyQ => 0x0010,
+        KeyW => 0x0011,
+        KeyE => 0x0012,
+        KeyR => 0x0013,
+        KeyT => 0x0014,
+        KeyY => 0x0015,
+        KeyU => 0x0016,
+        KeyI => 0x0017,
+        KeyO => 0x0018,
+        KeyP => 0x0019,
+        BracketLeft => 0x001a,
+        BracketRight => 0x001b,
+        Enter => 0x001c,
+        ControlLeft => 0x001d,
+        KeyA => 0x001e,
+        KeyS => 0x001f,
+        KeyD => 0x0020,
+        KeyF => 0x0021,
+        KeyG => 0x0022,
+        KeyH => 0x0023,
+        KeyJ => 0x0024,
+        KeyK => 0x0025,
+        KeyL => 0x0026,
+        Semicolon => 0x0027,
+        Quote => 0x0028,
+        Backquote => 0x0029,
+        ShiftLeft => 0x002a,
+        Backslash => 0x002b,
+        KeyZ => 0x002c,
+        KeyX => 0x002d,
+        KeyC => 0x002e,
+        KeyV => 0x002f,
+        KeyB => 0x0030,
+        KeyN => 0x0031,
+        KeyM => 0x0032,
+        Comma => 0x0033,
+        Period => 0x0034,
+        Slash => 0x0035,
+        ShiftRight => 0x0036,
+        NumpadMultiply => 0x0037,
+        AltLeft => 0x0038,
+        Space => 0x0039,
+        CapsLock => 0x003a,
+        F1 => 0x003b,
+        F2 => 0x003c,
+        F3 => 0x003d,
+        F4 => 0x003e,
+        F5 => 0x003f,
+        F6 => 0x0040,
+        F7 => 0x0041,
+        F8 => 0x0042,
+        F9 => 0x0043,
+        F10 => 0x0044,
+        NumLock => 0x0045,
+        ScrollLock => 0x0046,
+        Numpad7 => 0x0047,
+        Numpad8 => 0x0048,
+        Numpad9 => 0x0049,
+        NumpadSubtract => 0x004a,
+        Numpad4 => 0x004b,
+        Numpad5 => 0x004c,
+        Numpad6 => 0x004d,
+        NumpadAdd => 0x004e,
+        Numpad1 => 0x004f,
+        Numpad2 => 0x0050,
+        Numpad3 => 0x0051,
+        Numpad0 => 0x0052,
+        NumpadDecimal => 0x0053,
+        Lang5 => 0x0055, // Not Firefox, Not Safari
+        IntlBackslash => 0x0056,
+        F11 => 0x0057,
+        F12 => 0x0058,
+        IntlRo => 0x0059,
+        Lang3 => 0x005a, // Not Firefox, Not Safari
+        Lang4 => 0x005b, // Not Firefox, Not Safari
+        Convert => 0x005c,
+        KanaMode => 0x005d,
+        NonConvert => 0x005e,
+        NumpadEnter => 0x0060,
+        ControlRight => 0x0061,
+        NumpadDivide => 0x0062,
+        PrintScreen => 0x0063,
+        AltRight => 0x0064,
+        Home => 0x0066,
+        ArrowUp => 0x0067,
+        PageUp => 0x0068,
+        ArrowLeft => 0x0069,
+        ArrowRight => 0x006a,
+        End => 0x006b,
+        ArrowDown => 0x006c,
+        PageDown => 0x006d,
+        Insert => 0x006e,
+        Delete => 0x006f,
+        AudioVolumeMute => 0x0071,
+        AudioVolumeDown => 0x0072,
+        AudioVolumeUp => 0x0073,
+        Power => 0x0074, // Not Firefox, Not Safari
+        NumpadEqual => 0x0075,
+        Pause => 0x0077,
+        ShowAllWindows => 0x0078, // Chrome only
+        NumpadComma => 0x0079,
+        Lang1 => 0x007a,
+        Lang2 => 0x007b,
+        IntlYen => 0x007c,
+        MetaLeft => 0x007d,
+        MetaRight => 0x007e,
+        ContextMenu => 0x007f,
+        BrowserStop => 0x0080,
+        Again => 0x0081,
+        Props => 0x0082, // Not Chrome
+        Undo => 0x0083,
+        Select => 0x0084,
+        Copy => 0x0085,
+        Open => 0x0086,
+        Paste => 0x0087,
+        Find => 0x0088,
+        Cut => 0x0089,
+        Help => 0x008a,
+        LaunchApp2 => 0x008c,
+        Sleep => 0x008e, // Not Firefox, Not Safari
+        WakeUp => 0x008f,
+        LaunchApp1 => 0x0090,
+        LaunchMail => 0x009B,
+        BrowserFavorites => 0x009C,
+        BrowserBack => 0x009E,
+        BrowserForward => 0x009F,
+        Eject => 0x00A1,
+        MediaTrackNext => 0x00A3,
+        MediaPlayPause => 0x00A4,
+        MediaTrackPrevious => 0x00A5,
+        MediaStop => 0x00A6,
+        MediaRecord => 0x00A7, // Chrome only
+        MediaRewind => 0x00A8, // Chrome only
+        MediaSelect => 0x00AB,
+        BrowserHome => 0x00AC,
+        BrowserRefresh => 0x00AD,
+        NumpadParenLeft => 0x00B3,  // Not Firefox, Not Safari
+        NumpadParenRight => 0x00B4, // Not Firefox, Not Safari
+        F13 => 0x00B7,
+        F14 => 0x00B8,
+        F15 => 0x00B9,
+        F16 => 0x00BA,
+        F17 => 0x00BB,
+        F18 => 0x00BC,
+        F19 => 0x00BD,
+        F20 => 0x00BE,
+        F21 => 0x00BF,
+        F22 => 0x00C0,
+        F23 => 0x00C1,
+        F24 => 0x00C2,
+        MediaPause => 0x00C9,       // Chrome only
+        MediaPlay => 0x00CF,        // Chrome only
+        MediaFastForward => 0x00D0, // Chrome only
+        BrowserSearch => 0x00D9,
+        BrightnessDown => 0x00E0,       // Chrome only
+        BrightnessUp => 0x00E1,         // Chrome only
+        DisplayToggleIntExt => 0x00E3,  // Chrome only
+        MailSend => 0x00E7,             // Chrome only
+        MailReply => 0x00E8,            // Chrome only
+        MailForward => 0x00E9,          // Chrome only
+        ZoomToggle => 0x0174,           // Chrome only
+        LaunchControlPanel => 0x0243,   // Chrome only
+        SelectTask => 0x0244,           // Chrome only
+        LaunchScreenSaver => 0x0245,    // Chrome only
+        LaunchAssistant => 0x0247,      // Chrome only
+        KeyboardLayoutSelect => 0x0248, // Chrome only
+        PrivacyScreenToggle => 0x0279,
+        NumpadBackspace => todo!(),
+        NumpadClear => todo!(),
+        NumpadClearEntry => todo!(),
+        NumpadHash => todo!(),
+        NumpadMemoryAdd => todo!(),
+        NumpadMemoryClear => todo!(),
+        NumpadMemoryRecall => todo!(),
+        NumpadMemoryStore => todo!(),
+        NumpadMemorySubtract => todo!(),
+        NumpadStar => todo!(),
+        Fn => todo!(),
+        FnLock => todo!(),
+        Gamepad0 => todo!(),
+        Gamepad1 => todo!(),
+        Gamepad2 => todo!(),
+        Gamepad3 => todo!(),
+        Gamepad4 => todo!(),
+        Gamepad5 => todo!(),
+        Gamepad6 => todo!(),
+        Gamepad7 => todo!(),
+        Gamepad8 => todo!(),
+        Gamepad9 => todo!(),
+        Gamepad10 => todo!(),
+        Gamepad11 => todo!(),
+        Gamepad12 => todo!(),
+        Gamepad13 => todo!(),
+        Gamepad14 => todo!(),
+        Gamepad15 => todo!(),
+        Gamepad16 => todo!(),
+        Gamepad17 => todo!(),
+        Gamepad18 => todo!(),
+        Gamepad19 => todo!(), // Chrome only
+    })
+}
+
+/*
 impl TryFrom<KeyCode> for Key {
     type Error = Error;
     fn try_from(k: KeyCode) -> Result<Self> {
@@ -367,3 +622,4 @@ impl TryFrom<KeyCode> for Key {
         })
     }
 }
+*/
