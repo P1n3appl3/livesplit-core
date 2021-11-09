@@ -15,7 +15,7 @@ wasmtime = { version = "0.25.0", default-features = false }
 wasmtime-wasi = { version = "0.25.0", default-features = false }
 wasi-common = { version = "0.25.0", default-features = false }
 bytemuck = "1.2.0"
-wasi-cap-std-sync = { version = "0.25.0", default-features = false }
+wasi-cap-std-sync = { version = "0.31.0", default-features = false }
 
 [target.'cfg(windows)'.dependencies]
 winapi = { version = "0.3.5", features = [
