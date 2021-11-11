@@ -2,7 +2,6 @@ use crate::KeyCode;
 use parking_lot::Mutex;
 use std::{
     cell::RefCell,
-    char,
     collections::hash_map::{Entry, HashMap},
     mem, ptr,
     sync::{
@@ -21,9 +20,9 @@ use winapi::{
         libloaderapi::GetModuleHandleW,
         processthreadsapi::GetCurrentThreadId,
         winuser::{
-            CallNextHookEx, GetMessageW, MapVirtualKeyW, PostThreadMessageW,
-            SetWindowsHookExW, UnhookWindowsHookEx, KBDLLHOOKSTRUCT, LLKHF_EXTENDED,
-            MAPVK_VK_TO_CHAR, MAPVK_VSC_TO_VK_EX, WH_KEYBOARD_LL, WM_KEYDOWN,
+            CallNextHookEx, GetMessageW, MapVirtualKeyW, PostThreadMessageW, SetWindowsHookExW,
+            UnhookWindowsHookEx, KBDLLHOOKSTRUCT, LLKHF_EXTENDED, MAPVK_VK_TO_CHAR,
+            MAPVK_VSC_TO_VK_EX, WH_KEYBOARD_LL, WM_KEYDOWN,
         },
     },
 };
@@ -232,11 +231,7 @@ fn parse_scan_code(value: DWORD) -> Option<KeyCode> {
     })
 }
 
-unsafe extern "system" fn callback_proc(
-    code: c_int,
-    wparam: WPARAM,
-    lparam: LPARAM,
-) -> LRESULT {
+unsafe extern "system" fn callback_proc(code: c_int, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     STATE.with(|state| {
         let mut state = state.borrow_mut();
         let state = state.as_mut().expect("State should be initialized by now");
@@ -245,8 +240,8 @@ unsafe extern "system" fn callback_proc(
             let hook_struct = *(lparam as *const KBDLLHOOKSTRUCT);
             let event = wparam as UINT;
             if event == WM_KEYDOWN {
-                let scan_code = hook_struct.scanCode
-                    + ((hook_struct.flags & LLKHF_EXTENDED) * 0xE000);
+                let scan_code =
+                    hook_struct.scanCode + ((hook_struct.flags & LLKHF_EXTENDED) * 0xE000);
                 if let Some(key_code) = parse_scan_code(scan_code) {
                     state
                         .events
@@ -425,5 +420,7 @@ pub(crate) fn try_resolve(key_code: KeyCode) -> Option<String> {
     // Dead keys (diacritics) are indicated by setting the top bit of the return
     // value.
     const TOP_BIT_MASK: u32 = u32::MAX >> 1;
-    Some(char::from_u32(mapped_char & TOP_BIT_MASK)?.to_string())
+    let char = mapped_char & TOP_BIT_MASK;
+
+    Some(char::from_u32(char)?.to_string())
 }
