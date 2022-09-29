@@ -335,6 +335,8 @@ impl Timer {
             if Some(self.run.len()) == self.current_split_index {
                 self.phase = Ended;
                 self.attempt_ended = Some(AtomicDateTime::now());
+                #[cfg(feature = "std")]
+                self.run.try_auto_save();
             }
             self.run.mark_as_modified();
 
@@ -419,6 +421,8 @@ impl Timer {
             self.update_best_segments();
             self.update_pb_splits();
             self.update_segment_history();
+            #[cfg(feature = "std")]
+            self.run.try_auto_save();
         }
     }
 

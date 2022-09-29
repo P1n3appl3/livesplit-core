@@ -70,6 +70,9 @@ pub struct Run {
     attempt_history: Vec<Attempt>,
     metadata: RunMetadata,
     has_been_modified: bool,
+    /// When true (and the path to the splits file is provided), splits will be
+    /// saved upon every reset and finished run.
+    pub auto_save: bool,
     path: Option<PathBuf>,
     segments: Vec<Segment>,
     custom_comparisons: Vec<String>,
@@ -114,6 +117,7 @@ impl Run {
             attempt_history: Vec::new(),
             metadata: RunMetadata::new(),
             has_been_modified: false,
+            auto_save: true,
             path: None,
             segments: Vec::new(),
             custom_comparisons: vec![personal_best::NAME.to_string()],
@@ -754,6 +758,18 @@ impl Run {
             }
 
             min_id = reassign_id;
+        }
+    }
+
+    #[cfg(feature = "std")]
+    pub(crate) fn try_auto_save(&self) {
+        use crate::run::saver::livesplit::{save_run, IoWrite};
+        if self.auto_save {
+            if let Some(path) = self.path() {
+                if let Ok(file) = std::fs::File::create(path) {
+                    save_run(self, IoWrite(std::io::BufWriter::new(file))).ok();
+                }
+            }
         }
     }
 }
